@@ -17,7 +17,7 @@ current_step=""
 on_error() { local code=$?; bluw_log "error" "$current_step" "code=$code"; echo "Falha na etapa: $current_step"; exit "$code"; }
 trap on_error ERR
 run_step() { current_step="$1"; bluw_log "step_start" "$1" ""; shift; "$@"; bluw_log "step_done" "$current_step" ""; }
-ask() { local var="$1"; local msg="$2"; if [ -n "${!var-}" ]; then return 0; fi; read -r -p "$msg" value; eval "$var=\"$value\""; }
+ask() { local var="$1"; local msg="$2"; if [ -n "${!var-}" ]; then return 0; fi; if [ -t 0 ]; then read -r -p "$msg" value; else read -r -p "$msg" value < /dev/tty; fi; eval "$var=\"$value\""; }
 ensure_network() { if ! _network_exists proxy; then docker network create proxy >/dev/null; fi; }
 load_config() { if [ -f setup.env ]; then . setup.env; fi; }
 validate_config() { echo "$LETSENCRYPT_EMAIL" | grep -Eq '^[^@\s]+@[^@\s]+\.[^@\s]+$' || { echo "Email inválido"; exit 1; } ; echo "$PORTAINER_DOMAIN" | grep -Eq '^[A-Za-z0-9.-]+$' || { echo "Dominio inválido"; exit 1; } ; getent hosts "$PORTAINER_DOMAIN" >/dev/null 2>&1 || true; }
@@ -26,7 +26,7 @@ detect_os() { if [ -f /etc/os-release ]; then . /etc/os-release; OS_ID="$ID"; OS
 install_base() { $SUDO apt-get update -y >/dev/null; $SUDO apt-get install -y ca-certificates curl gnupg >/dev/null; }
 install_docker() { if _has docker && _docker_ok; then return 0; fi; $SUDO install -m 0755 -d /etc/apt/keyrings; curl -fsSL https://download.docker.com/linux/$OS_ID/gpg | $SUDO gpg --dearmor -o /etc/apt/keyrings/docker.gpg; $SUDO chmod a+r /etc/apt/keyrings/docker.gpg; echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$OS_ID $OS_CODENAME stable" | $SUDO tee /etc/apt/sources.list.d/docker.list >/dev/null; $SUDO apt-get update -y >/dev/null; $SUDO apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >/dev/null; $SUDO systemctl enable --now docker; if [ -n "$SUDO" ]; then $SUDO usermod -aG docker "$USER" || true; fi }
 open_ports() { if command -v ufw >/dev/null 2>&1; then if $SUDO ufw status | grep -q active; then $SUDO ufw allow 80/tcp >/dev/null || true; $SUDO ufw allow 443/tcp >/dev/null || true; fi; elif command -v firewall-cmd >/dev/null 2>&1; then $SUDO firewall-cmd --add-service=http --permanent >/dev/null || true; $SUDO firewall-cmd --add-service=https --permanent >/dev/null || true; $SUDO firewall-cmd --reload >/dev/null || true; fi }
-prompt_config() { while true; do ask LETSENCRYPT_EMAIL "Email do LetsEncrypt: "; ask PORTAINER_DOMAIN "Dominio do Portainer (ex: portainer.seudominio.com): "; echo "Resumo:"; echo "Email: $LETSENCRYPT_EMAIL"; echo "Dominio: $PORTAINER_DOMAIN"; read -r -p "Confirmar? (Y/N): " c; case "$c" in Y|y) break ;; N|n) : ;; *) ;; esac; done }
+prompt_config() { while true; do ask LETSENCRYPT_EMAIL "Email do LetsEncrypt: "; ask PORTAINER_DOMAIN "Dominio do Portainer (ex: portainer.seudominio.com): "; echo "Resumo:"; echo "Email: $LETSENCRYPT_EMAIL"; echo "Dominio: $PORTAINER_DOMAIN"; if [ -t 0 ]; then read -r -p "Confirmar? (Y/N): " c; else read -r -p "Confirmar? (Y/N): " c < /dev/tty; fi; case "$c" in Y|y) break ;; N|n) : ;; *) ;; esac; done }
 write_files() { mkdir -p infra/letsencrypt; touch infra/letsencrypt/acme.json; chmod 600 infra/letsencrypt/acme.json || true; printf "LE_EMAIL=%s\nPORTAINER_DOMAIN=%s\n" "$LETSENCRYPT_EMAIL" "$PORTAINER_DOMAIN" > infra/.env; cat > infra/docker-compose.yml <<'YML'
 version: "3.8"
 services:
