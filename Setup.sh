@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+# --------------------------------------------------------------------------------------
+# Bluw Setup - Instalação e configuração de Docker, Traefik + Let's Encrypt e Portainer
+# Método de execução: bash <(curl -sSL https://raw.githubusercontent.com/ramonsousap/bluew/main/Setup.sh)
+# Compatibilidade: Ubuntu 18.04+, 20.04+ | Debian 10+ | CentOS 7+, 8+ (RHEL/Alma/Rocky)
+# Funcionalidades essenciais: instalação Docker, Compose, rede proxy, Traefik c/ ACME, Portainer
+# Segurança: sem telemetria, logs locais, validação e rollback em falhas críticas
+# --------------------------------------------------------------------------------------
 set -euo pipefail
 declare -A BLUW_TOOLS
 bluw_register_tool() { local id="$1"; local name="$2"; local handler="$3"; local version="${4:-}"; local deps="${5:-}"; local config="${6:-}"; BLUW_TOOLS["$id"]="name=$name;handler=$handler;version=$version;deps=$deps;config=$config"; }
@@ -14,17 +21,54 @@ bluw_run_tool() { local id="$1"; local instance="${2:-}"; local handler; handler
 bluw_tool_doc() { local id="$1"; local name version deps config; name=$(bluw_get_tool_field "$id" name); version=$(bluw_get_tool_field "$id" version); deps=$(bluw_get_tool_field "$id" deps); config=$(bluw_get_tool_field "$id" config); echo "id=$id"; echo "name=$name"; echo "version=$version"; echo "deps=$deps"; echo "config=$config"; }
 bluw_log() { local event="$1"; local tool="$2"; local message="${3:-}"; local ts; ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ"); local dir="./logs"; mkdir -p "$dir"; printf '{"ts":"%s","event":"%s","tool":"%s","message":"%s"}\n' "$ts" "$event" "$tool" "${message//\"/\' }" >> "$dir"/events.jsonl; }
 current_step=""
-on_error() { local code=$?; bluw_log "error" "$current_step" "code=$code"; echo "Falha na etapa: $current_step"; exit "$code"; }
+rollback_needed=false
+network_created=false
+on_error() { local code=$?; bluw_log "error" "$current_step" "code=$code"; echo "Falha na etapa: $current_step"; if [ "$rollback_needed" = true ]; then rollback; fi; exit "$code"; }
 trap on_error ERR
 run_step() { current_step="$1"; bluw_log "step_start" "$1" ""; shift; "$@"; bluw_log "step_done" "$current_step" ""; }
 ask() { local var="$1"; local msg="$2"; if [ -n "${!var-}" ]; then return 0; fi; if [ -t 0 ]; then read -r -p "$msg" value; else read -r -p "$msg" value < /dev/tty; fi; eval "$var=\"$value\""; }
-ensure_network() { if ! _network_exists proxy; then docker network create proxy >/dev/null; fi; }
+ensure_network() { if ! _network_exists proxy; then docker network create proxy >/dev/null; network_created=true; fi; }
 load_config() { if [ -f setup.env ]; then . setup.env; fi; }
 validate_config() { echo "$LETSENCRYPT_EMAIL" | grep -Eq '^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$' || { echo "Email inválido"; exit 1; } ; echo "$PORTAINER_DOMAIN" | grep -Eq '^[A-Za-z0-9.-]+$' || { echo "Dominio inválido"; exit 1; } ; getent hosts "$PORTAINER_DOMAIN" >/dev/null 2>&1 || true; }
 ensure_privileges() { if [ "$(id -u)" -ne 0 ]; then SUDO=sudo; else SUDO=; fi; }
-detect_os() { if [ -f /etc/os-release ]; then . /etc/os-release; OS_ID="$ID"; OS_CODENAME="${VERSION_CODENAME:-}"; else echo "Sistema não suportado"; exit 1; fi; case "$OS_ID" in ubuntu|debian) : ;; *) echo "Distribuição não suportada"; exit 1 ;; esac }
-install_base() { $SUDO apt-get update -y >/dev/null; $SUDO apt-get install -y ca-certificates curl gnupg >/dev/null; }
-install_docker() { if _has docker && _docker_ok; then return 0; fi; $SUDO install -m 0755 -d /etc/apt/keyrings; curl -fsSL https://download.docker.com/linux/$OS_ID/gpg | $SUDO gpg --dearmor -o /etc/apt/keyrings/docker.gpg; $SUDO chmod a+r /etc/apt/keyrings/docker.gpg; echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$OS_ID $OS_CODENAME stable" | $SUDO tee /etc/apt/sources.list.d/docker.list >/dev/null; $SUDO apt-get update -y >/dev/null; $SUDO apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >/dev/null; $SUDO systemctl enable --now docker; if [ -n "$SUDO" ]; then $SUDO usermod -aG docker "$USER" || true; fi }
+detect_os() { if [ -f /etc/os-release ]; then . /etc/os-release; OS_ID="$ID"; OS_CODENAME="${VERSION_CODENAME:-}"; else echo "Sistema não suportado"; exit 1; fi; case "$OS_ID" in ubuntu|debian) PKG_MGR=apt ;; centos|rhel|almalinux|rocky) PKG_MGR=yum; command -v dnf >/dev/null 2>&1 && PKG_MGR=dnf ;; *) echo "Distribuição não suportada"; exit 1 ;; esac }
+install_base() {
+  case "$PKG_MGR" in
+    apt) $SUDO apt-get update -y >/dev/null; $SUDO apt-get install -y ca-certificates curl gnupg >/dev/null ;;
+    yum) $SUDO yum -y install yum-utils ca-certificates curl gnupg2 >/dev/null || true ;;
+    dnf) $SUDO dnf -y install dnf-plugins-core ca-certificates curl gnupg2 >/dev/null || true ;;
+  esac
+}
+install_docker() {
+  if _has docker && _docker_ok; then return 0; fi
+  case "$PKG_MGR" in
+    apt)
+      $SUDO install -m 0755 -d /etc/apt/keyrings
+      curl -fsSL https://download.docker.com/linux/$OS_ID/gpg | $SUDO gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+      $SUDO chmod a+r /etc/apt/keyrings/docker.gpg
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$OS_ID $OS_CODENAME stable" | $SUDO tee /etc/apt/sources.list.d/docker.list >/dev/null
+      $SUDO apt-get update -y >/dev/null
+      $SUDO apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >/dev/null
+      ;;
+    yum)
+      $SUDO yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo >/dev/null
+      $SUDO yum -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin >/dev/null
+      ;;
+    dnf)
+      $SUDO dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo >/dev/null || true
+      $SUDO dnf -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin >/dev/null
+      ;;
+  esac
+  $SUDO systemctl enable --now docker
+  if [ -n "$SUDO" ]; then $SUDO usermod -aG docker "$USER" || true; fi
+}
+ensure_compose() {
+  if docker compose version >/dev/null 2>&1; then return 0; fi
+  if command -v docker-compose >/dev/null 2>&1; then return 0; fi
+  local url="https://github.com/docker/compose/releases/download/v2.23.0/docker-compose-$(uname -s)-$(uname -m)"
+  $SUDO curl -fsSL "$url" -o /usr/local/bin/docker-compose
+  $SUDO chmod +x /usr/local/bin/docker-compose
+}
 open_ports() { if command -v ufw >/dev/null 2>&1; then if $SUDO ufw status | grep -q active; then $SUDO ufw allow 80/tcp >/dev/null || true; $SUDO ufw allow 443/tcp >/dev/null || true; fi; elif command -v firewall-cmd >/dev/null 2>&1; then $SUDO firewall-cmd --add-service=http --permanent >/dev/null || true; $SUDO firewall-cmd --add-service=https --permanent >/dev/null || true; $SUDO firewall-cmd --reload >/dev/null || true; fi }
 prompt_config() { while true; do ask LETSENCRYPT_EMAIL "Email do LetsEncrypt: "; ask PORTAINER_DOMAIN "Dominio do Portainer (ex: portainer.seudominio.com): "; echo "Resumo:"; echo "Email: $LETSENCRYPT_EMAIL"; echo "Dominio: $PORTAINER_DOMAIN"; if [ -t 0 ]; then read -r -p "Confirmar? (Y/N): " c; else read -r -p "Confirmar? (Y/N): " c < /dev/tty; fi; case "$c" in Y|y) break ;; N|n) : ;; *) ;; esac; done }
 write_files() { mkdir -p infra/letsencrypt; touch infra/letsencrypt/acme.json; chmod 600 infra/letsencrypt/acme.json || true; printf "LE_EMAIL=%s\nPORTAINER_DOMAIN=%s\n" "$LETSENCRYPT_EMAIL" "$PORTAINER_DOMAIN" > infra/.env; cat > infra/docker-compose.yml <<'YML'
@@ -82,7 +126,9 @@ wait_container() { local name="$1"; local tries=60; while [ "$tries" -gt 0 ]; do
 wait_tls() { local tries=120; while [ "$tries" -gt 0 ]; do if grep -q "$PORTAINER_DOMAIN" infra/letsencrypt/acme.json 2>/dev/null; then return 0; fi; sleep 2; tries=$((tries-1)); done; return 1; }
 check_https() { curl -sI --connect-timeout 10 "https://$PORTAINER_DOMAIN" | head -n1 | grep -q "HTTP/"; }
 generate_report() { mkdir -p reports; local ts; ts=$(date -u +"%Y%m%dT%H%M%SZ"); local cmd; cmd=$(_compose_cmd); local net; net=$(docker network ls --format '{{.Name}}' | grep -q '^proxy$' && echo true || echo false); local tra; tra=$(docker ps --format '{{.Names}}' | grep -q '^traefik$' && echo true || echo false); local por; por=$(docker ps --format '{{.Names}}' | grep -q '^portainer$' && echo true || echo false); local tls; tls=$(grep -q "$PORTAINER_DOMAIN" infra/letsencrypt/acme.json 2>/dev/null && echo true || echo false); local https; https=$(check_https && echo true || echo false); printf '{"timestamp":"%s","compose_cmd":"%s","email":"%s","domain":"%s","network_proxy":"%s","traefik_running":"%s","portainer_running":"%s","tls_ready":"%s","https_ok":"%s"}\n' "$ts" "$cmd" "$LETSENCRYPT_EMAIL" "$PORTAINER_DOMAIN" "$net" "$tra" "$por" "$tls" "$https" > "reports/infra_report.json"; }
-bluw_tool_infra() { load_config; ensure_privileges; detect_os; run_step "install_base" install_base; run_step "install_docker" install_docker; if ! _compose_cmd >/dev/null; then echo "Compose indisponível"; exit 1; fi; if [ -z "${LETSENCRYPT_EMAIL-}" ] || [ -z "${PORTAINER_DOMAIN-}" ]; then prompt_config; fi; validate_config; run_step "open_ports" open_ports; run_step "ensure_network" ensure_network; run_step "write_files" write_files; run_step "compose_up" compose_up; run_step "wait_traefik" wait_container traefik; run_step "wait_portainer" wait_container portainer; run_step "wait_tls" wait_tls; run_step "report" generate_report; echo "HTTPS em https://$PORTAINER_DOMAIN"; }
+rollback() { echo "Executando rollback..."; local cmd; cmd=$(_compose_cmd); if [ -d infra ]; then (cd infra && $cmd down || true); fi; if [ "$network_created" = true ]; then docker network rm proxy >/dev/null 2>&1 || true; fi }
+run_tests() { echo "Iniciando testes"; ensure_privileges; detect_os; install_base; echo "OK base"; install_docker; ensure_compose; echo "OK docker+compose"; LETSENCRYPT_EMAIL="test@example.com" PORTAINER_DOMAIN="portainer.example.com"; validate_config || true; echo "Validação executada"; echo "Testes concluídos"; }
+bluw_tool_infra() { load_config; ensure_privileges; detect_os; run_step "install_base" install_base; run_step "install_docker" install_docker; run_step "ensure_compose" ensure_compose; if [ -z "${LETSENCRYPT_EMAIL-}" ] || [ -z "${PORTAINER_DOMAIN-}" ]; then prompt_config; fi; validate_config; run_step "open_ports" open_ports; run_step "ensure_network" ensure_network; rollback_needed=true; run_step "write_files" write_files; run_step "compose_up" compose_up; run_step "wait_traefik" wait_container traefik; run_step "wait_portainer" wait_container portainer; run_step "wait_tls" wait_tls; run_step "report" generate_report; echo "HTTPS em https://$PORTAINER_DOMAIN"; }
 bluw_register_tool "infra" "InfraCompose" "bluw_tool_infra" "v1" "docker,compose" '{}'
 cmd="${1:-}"
 case "$cmd" in
@@ -90,5 +136,6 @@ case "$cmd" in
   run) id="${2:-}"; inst="${3:-}"; bluw_log "start" "$id" ""; bluw_run_tool "$id" "$inst"; bluw_log "done" "$id" "" ;;
   info) id="${2:-}"; bluw_tool_doc "$id" ;;
   "") bluw_run_tool infra ;;
+  test) run_tests ;;
   *) echo "list|run <id> [inst]|info <id>" ;;
 esac
