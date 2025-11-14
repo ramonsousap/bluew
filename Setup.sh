@@ -21,11 +21,26 @@ bluw_run_tool() { local id="$1"; local instance="${2:-}"; local handler; handler
 bluw_tool_doc() { local id="$1"; local name version deps config; name=$(bluw_get_tool_field "$id" name); version=$(bluw_get_tool_field "$id" version); deps=$(bluw_get_tool_field "$id" deps); config=$(bluw_get_tool_field "$id" config); echo "id=$id"; echo "name=$name"; echo "version=$version"; echo "deps=$deps"; echo "config=$config"; }
 bluw_log() { local event="$1"; local tool="$2"; local message="${3:-}"; local ts; ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ"); local dir="./logs"; mkdir -p "$dir"; printf '{"ts":"%s","event":"%s","tool":"%s","message":"%s"}\n' "$ts" "$event" "$tool" "${message//\"/\' }" >> "$dir"/events.jsonl; }
 current_step=""
+STEP_TOTAL=0
+STEP_INDEX=0
+SHOW_LOGS=""
 rollback_needed=false
 network_created=false
 on_error() { local code=$?; bluw_log "error" "$current_step" "code=$code"; echo "Falha na etapa: $current_step"; if [ "$rollback_needed" = true ]; then rollback; fi; exit "$code"; }
 trap on_error ERR
-run_step() { current_step="$1"; bluw_log "step_start" "$1" ""; shift; "$@"; bluw_log "step_done" "$current_step" ""; }
+term_cols() { tput cols 2>/dev/null || echo 80; }
+ui_logo() { printf "\033[1;36m"; echo "╔══════════════════════════════════════════════════════════╗"; printf "║ %-56s ║\n" "BLUEW"; echo "╚══════════════════════════════════════════════════════════╝"; printf "\033[0m"; }
+ui_init() { printf "\033[2J\033[H"; ui_logo; }
+ui_set_total() { STEP_TOTAL=$1; STEP_INDEX=0; }
+ui_bar() { local p="$1"; local cols; cols=$(term_cols); local w=$((cols-30)); [ "$w" -lt 10 ] && w=10; local fill=$((w*p/100)); local empty=$((w-fill)); printf "\r[\033[1;34m%.*s\033[0m%.*s] %3d%%" "$fill" "==================================================" "$empty" "                                                  " "$p"; }
+ui_msg() { local msg="$1"; printf "\n\033[1;37m%s\033[0m\n" "$msg"; }
+ui_step_start() { STEP_INDEX=$((STEP_INDEX+1)); local pct=$((STEP_INDEX*100/STEP_TOTAL)); ui_bar "$pct"; ui_msg "Etapa $STEP_INDEX/$STEP_TOTAL: $1"; }
+ui_step_done() { ui_msg "Concluída: $1"; }
+ui_error() { printf "\n\033[1;31mErro na etapa: %s\033[0m\n" "$current_step"; }
+update_progress() { mkdir -p logs; printf '{"step":%s,"total":%s}\n' "$STEP_INDEX" "$STEP_TOTAL" > logs/progress.json; }
+spinner_start() { local frames='|/-\'; SPIN_STOP=false; ( while true; do for i in $(seq 0 3); do printf "\r\033[1;36m%s\033[0m" "${frames:$i:1}"; sleep 0.1; done; done ) & SPIN_PID=$!; }
+spinner_stop() { [ -n "${SPIN_PID-}" ] && kill "$SPIN_PID" >/dev/null 2>&1 || true; printf "\r "; }
+run_step() { current_step="$1"; bluw_log "step_start" "$1" ""; ui_step_start "$1"; update_progress; spinner_start; shift; "$@" > >(tee -a logs/stream.log) 2> >(tee -a logs/stream.log >&2); spinner_stop; bluw_log "step_done" "$current_step" ""; ui_step_done "$current_step"; update_progress; if [ "$SHOW_LOGS" = "Y" ] || [ "$SHOW_LOGS" = "y" ]; then echo "Detalhes:"; tail -n 10 logs/stream.log || true; fi }
 ask() { local var="$1"; local msg="$2"; if [ -n "${!var-}" ]; then return 0; fi; if [ -t 0 ]; then read -r -p "$msg" value; else read -r -p "$msg" value < /dev/tty; fi; eval "$var=\"$value\""; }
 ensure_network() { if ! _network_exists proxy; then docker network create proxy >/dev/null; network_created=true; fi; }
 load_config() { if [ -f setup.env ]; then . setup.env; fi; }
@@ -69,8 +84,8 @@ ensure_compose() {
   $SUDO curl -fsSL "$url" -o /usr/local/bin/docker-compose
   $SUDO chmod +x /usr/local/bin/docker-compose
 }
-open_ports() { if command -v ufw >/dev/null 2>&1; then if $SUDO ufw status | grep -q active; then $SUDO ufw allow 80/tcp >/dev/null || true; $SUDO ufw allow 443/tcp >/dev/null || true; fi; elif command -v firewall-cmd >/dev/null 2>&1; then $SUDO firewall-cmd --add-service=http --permanent >/dev/null || true; $SUDO firewall-cmd --add-service=https --permanent >/dev/null || true; $SUDO firewall-cmd --reload >/dev/null || true; fi }
-prompt_config() { while true; do ask LETSENCRYPT_EMAIL "Email do LetsEncrypt: "; ask PORTAINER_DOMAIN "Dominio do Portainer (ex: portainer.seudominio.com): "; echo "Resumo:"; echo "Email: $LETSENCRYPT_EMAIL"; echo "Dominio: $PORTAINER_DOMAIN"; if [ -t 0 ]; then read -r -p "Confirmar? (Y/N): " c; else read -r -p "Confirmar? (Y/N): " c < /dev/tty; fi; case "$c" in Y|y) break ;; N|n) : ;; *) ;; esac; done }
+open_ports() { if command -v ufw >/dev/null 2>&1; then if $SUDO ufw status | grep -q active; then $SUDO ufw allow 80/tcp >/dev/null || true; $SUDO ufw allow 443/tcp >/dev/null || true; $SUDO ufw allow 7688/tcp >/dev/null || true; fi; elif command -v firewall-cmd >/dev/null 2>&1; then $SUDO firewall-cmd --add-service=http --permanent >/dev/null || true; $SUDO firewall-cmd --add-service=https --permanent >/dev/null || true; $SUDO firewall-cmd --add-port=7688/tcp --permanent >/dev/null || true; $SUDO firewall-cmd --reload >/dev/null || true; fi }
+prompt_config() { while true; do ask LETSENCRYPT_EMAIL "Email do LetsEncrypt: "; ask PORTAINER_DOMAIN "Dominio do Portainer (ex: portainer.seudominio.com): "; ask SHOW_LOGS "Exibir detalhes técnicos (logs)? (Y/N): "; echo "Resumo:"; echo "Email: $LETSENCRYPT_EMAIL"; echo "Dominio: $PORTAINER_DOMAIN"; echo "Logs: ${SHOW_LOGS:-N}"; if [ -t 0 ]; then read -r -p "Confirmar? (Y/N): " c; else read -r -p "Confirmar? (Y/N): " c < /dev/tty; fi; case "$c" in Y|y) break ;; N|n) : ;; *) ;; esac; done }
 write_files() { mkdir -p infra/letsencrypt; touch infra/letsencrypt/acme.json; chmod 600 infra/letsencrypt/acme.json || true; printf "LE_EMAIL=%s\nPORTAINER_DOMAIN=%s\n" "$LETSENCRYPT_EMAIL" "$PORTAINER_DOMAIN" > infra/.env; cat > infra/docker-compose.yml <<'YML'
 version: "3.8"
 services:
@@ -99,11 +114,16 @@ services:
   portainer:
     image: portainer/portainer-ce:latest
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/run/docker.sock:/var/run/docker.sock
       - portainer_data:/data
     networks:
       - proxy
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/api/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
     labels:
       - traefik.enable=true
       - traefik.http.routers.portainer.rule=Host(`${PORTAINER_DOMAIN}`)
@@ -122,7 +142,7 @@ networks:
 YML
 }
 compose_up() { local cmd; cmd=$(_compose_cmd); (cd infra && $cmd --env-file ./.env up -d); }
-wait_container() { local name="$1"; local tries=60; while [ "$tries" -gt 0 ]; do if docker ps --format '{{.Names}}' | grep -q "^$name$"; then return 0; fi; sleep 2; tries=$((tries-1)); done; return 1; }
+wait_container() { local name="$1"; local tries=60; while [ "$tries" -gt 0 ]; do if docker ps --format '{{.Names}}' | grep -q "^$name$"; then if [ "$name" = "portainer" ]; then if docker inspect --format='{{.State.Health.Status}}' portainer 2>/dev/null | grep -q "healthy"; then return 0; fi; fi; return 0; fi; sleep 2; tries=$((tries-1)); done; return 1; }
 wait_tls() { local tries=120; while [ "$tries" -gt 0 ]; do if grep -q "$PORTAINER_DOMAIN" infra/letsencrypt/acme.json 2>/dev/null; then return 0; fi; sleep 2; tries=$((tries-1)); done; return 1; }
 check_https() { curl -sI --connect-timeout 10 "https://$PORTAINER_DOMAIN" | head -n1 | grep -q "HTTP/"; }
 generate_report() { mkdir -p reports; local ts; ts=$(date -u +"%Y%m%dT%H%M%SZ"); local cmd; cmd=$(_compose_cmd); local net; net=$(docker network ls --format '{{.Name}}' | grep -q '^proxy$' && echo true || echo false); local tra; tra=$(docker ps --format '{{.Names}}' | grep -q '^traefik$' && echo true || echo false); local por; por=$(docker ps --format '{{.Names}}' | grep -q '^portainer$' && echo true || echo false); local tls; tls=$(grep -q "$PORTAINER_DOMAIN" infra/letsencrypt/acme.json 2>/dev/null && echo true || echo false); local https; https=$(check_https && echo true || echo false); printf '{"timestamp":"%s","compose_cmd":"%s","email":"%s","domain":"%s","network_proxy":"%s","traefik_running":"%s","portainer_running":"%s","tls_ready":"%s","https_ok":"%s"}\n' "$ts" "$cmd" "$LETSENCRYPT_EMAIL" "$PORTAINER_DOMAIN" "$net" "$tra" "$por" "$tls" "$https" > "reports/infra_report.json"; }
@@ -135,7 +155,7 @@ case "$cmd" in
   list) bluw_list_tools ;;
   run) id="${2:-}"; inst="${3:-}"; bluw_log "start" "$id" ""; bluw_run_tool "$id" "$inst"; bluw_log "done" "$id" "" ;;
   info) id="${2:-}"; bluw_tool_doc "$id" ;;
-  "") bluw_run_tool infra ;;
+  "") ui_init; ui_set_total 12; bluw_run_tool infra ;;
   test) run_tests ;;
   *) echo "list|run <id> [inst]|info <id>" ;;
 esac
