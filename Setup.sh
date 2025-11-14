@@ -20,7 +20,7 @@ run_step() { current_step="$1"; bluw_log "step_start" "$1" ""; shift; "$@"; bluw
 ask() { local var="$1"; local msg="$2"; if [ -n "${!var-}" ]; then return 0; fi; if [ -t 0 ]; then read -r -p "$msg" value; else read -r -p "$msg" value < /dev/tty; fi; eval "$var=\"$value\""; }
 ensure_network() { if ! _network_exists proxy; then docker network create proxy >/dev/null; fi; }
 load_config() { if [ -f setup.env ]; then . setup.env; fi; }
-validate_config() { echo "$LETSENCRYPT_EMAIL" | grep -Eq '^[^@\s]+@[^@\s]+\.[^@\s]+$' || { echo "Email inválido"; exit 1; } ; echo "$PORTAINER_DOMAIN" | grep -Eq '^[A-Za-z0-9.-]+$' || { echo "Dominio inválido"; exit 1; } ; getent hosts "$PORTAINER_DOMAIN" >/dev/null 2>&1 || true; }
+validate_config() { echo "$LETSENCRYPT_EMAIL" | grep -Eq '^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$' || { echo "Email inválido"; exit 1; } ; echo "$PORTAINER_DOMAIN" | grep -Eq '^[A-Za-z0-9.-]+$' || { echo "Dominio inválido"; exit 1; } ; getent hosts "$PORTAINER_DOMAIN" >/dev/null 2>&1 || true; }
 ensure_privileges() { if [ "$(id -u)" -ne 0 ]; then SUDO=sudo; else SUDO=; fi; }
 detect_os() { if [ -f /etc/os-release ]; then . /etc/os-release; OS_ID="$ID"; OS_CODENAME="${VERSION_CODENAME:-}"; else echo "Sistema não suportado"; exit 1; fi; case "$OS_ID" in ubuntu|debian) : ;; *) echo "Distribuição não suportada"; exit 1 ;; esac }
 install_base() { $SUDO apt-get update -y >/dev/null; $SUDO apt-get install -y ca-certificates curl gnupg >/dev/null; }
